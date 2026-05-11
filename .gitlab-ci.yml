@@ -1,0 +1,13 @@
+stages:
+  - publish
+
+publish-npm:
+  stage: publish
+  image: node:latest # Use a Node.js image
+  script:
+    - npm i # Install dependencies
+    - npm run build # Build your Vite plugin
+    - echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc # Create .npmrc with token
+    - npm publish --access public --tag latest
+  only:
+    - main # Run only on main branch
