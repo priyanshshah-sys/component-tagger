@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import { transformCode } from '../core/transform';
 import { ComponentTagOptions } from '../types';
 
@@ -11,76 +12,81 @@ interface LoaderContext {
 }
 
 /**
- * Strips Next.js-injected internal RSC boundary comment lines from the top
- * of a source file and returns both the cleaned source and the number of
- * lines that were removed (the line offset).
+ * Finds the number of lines that Next.js has prepended to the source
+ * before the actual file content begins.
  *
- * Problem being solved:
- *   Next.js prepends internal marker comments to Client Component files
- *   during the CLIENT webpack compilation pass, e.g.:
- *     // (module __next_internal_client_entry_do_not_use__ ...)
- *   These lines are NOT present in the SERVER webpack compilation pass.
- *   Because the tagger reads JSX line numbers from Babel's AST (which are
- *   relative to the source it receives), the same JSX element gets different
- *   line numbers on server vs client — causing data-component-id /
- *   data-component-line to differ between the two compiled bundles.
- *   React hydration then detects the attribute mismatch and throws.
+ * WHY THIS IS NEEDED:
+ * Next.js modifies Client Component files during the CLIENT webpack
+ * compilation pass by prepending RSC boundary/module wrapper code.
+ * This shifts all JSX line numbers, causing data-component-id /
+ * data-component-line to differ between server and client bundles:
  *
- * Fix:
- *   Strip the injected lines before Babel parses the source so both passes
- *   see the same line numbers. Pass the removed line count as `lineOffset`
- *   to transformCode so all emitted line attributes reference the original
- *   source positions.
+ *   Server pass receives:  original Sidebar.tsx — line 59 = the div
+ *   Client pass receives:  [16 injected lines] + Sidebar.tsx — line 59
+ *                          is now in injected code, div is at line 75
  *
- * @param source - Raw source received by the webpack loader
- * @returns normalizedSource (header stripped) and lineOffset (lines removed)
+ *   React hydration: "59:4" (server) ≠ "75:4" (client) → CRASH
+ *
+ * WHY NOT PATTERN MATCHING:
+ * The injected content format varies across Next.js versions and is
+ * not a simple comment — it can be multiple lines of actual JS code.
+ * Pattern matching is fragile and produced lineOffset=0 in practice.
+ *
+ * CORRECT APPROACH:
+ * Read the original file from disk. Find where its first line appears
+ * in the transformed source. That index IS the exact offset — no
+ * pattern matching needed, works with any injected format.
+ *
+ * @param transformedSource - Source received by the webpack loader
+ * @param filePath - Absolute path to the original file on disk
+ * @returns Number of lines prepended by Next.js (0 if none detected)
  */
-function stripNextJsInjectedHeader(source: string): {
-  normalizedSource: string;
-  lineOffset: number;
-} {
-  const lines = source.split('\n');
-  let injectedLines = 0;
+function findLineOffset(transformedSource: string, filePath: string): number {
+  try {
+    const originalSource = fs.readFileSync(filePath, 'utf-8');
+    const origLines = originalSource.split('\n');
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (
-      // Next.js App Router RSC boundary marker (most common pattern)
-      trimmed.startsWith('// (module __next_internal') ||
-      // Alternative internal marker format
-      trimmed.startsWith('// __next_internal') ||
-      // Blank lines that follow an injected marker
-      (injectedLines > 0 && trimmed === '')
-    ) {
-      injectedLines++;
-    } else {
-      // First non-injected line — stop scanning
-      break;
+    // Find the first non-empty line of the original file to use as anchor
+    let anchorLine = '';
+    let anchorOrigIndex = 0;
+    for (let i = 0; i < origLines.length; i++) {
+      if (origLines[i].trim()) {
+        anchorLine = origLines[i];
+        anchorOrigIndex = i;
+        break;
+      }
     }
-  }
 
-  if (injectedLines === 0) {
-    return { normalizedSource: source, lineOffset: 0 };
-  }
+    if (!anchorLine) return 0;
 
-  return {
-    normalizedSource: lines.slice(injectedLines).join('\n'),
-    lineOffset: injectedLines,
-  };
+    const transformedLines = transformedSource.split('\n');
+
+    // Find where the anchor line first appears in the transformed source
+    for (let i = 0; i < transformedLines.length; i++) {
+      if (transformedLines[i] === anchorLine) {
+        // Offset = position in transformed source minus position in original
+        return i - anchorOrigIndex;
+      }
+    }
+
+    return 0;
+  } catch {
+    // File read failed (e.g. virtual module) — no offset applied
+    return 0;
+  }
 }
 
 /**
  * Custom JSX Loader that adds tracking attributes to JSX elements.
  *
- * Strips Next.js-injected RSC header lines before transformation so that
+ * Detects and corrects Next.js RSC header line injection so that
  * data-component-id and data-component-line values are identical between
  * the server and client webpack compilation passes, preventing React
  * hydration errors caused by mismatched attribute values.
  *
  * @param this - The webpack loader context
- * @param source - The source code to transform
- * @returns The transformed source code
+ * @param source - The source code to transform (may have Next.js-injected lines prepended)
+ * @returns The transformed source code with correct line-number attributes
  */
 async function webPackLoader(
   this: LoaderContext,
@@ -103,14 +109,15 @@ async function webPackLoader(
     ...this.query,
   };
 
-  // Strip Next.js-injected RSC boundary lines so Babel sees the same
-  // source on both the server and client webpack compilation passes.
-  // The lineOffset corrects all emitted line-number attributes so they
-  // still reference the original (unmodified) source positions.
-  const { normalizedSource, lineOffset } = stripNextJsInjectedHeader(source);
+  // Detect how many lines Next.js prepended to this file during the client
+  // webpack compilation pass. These prepended lines shift JSX line numbers,
+  // causing data-component-id to differ between server and client → hydration error.
+  // We correct this by reading the original file from disk and finding where
+  // its content starts in the transformed source.
+  const lineOffset = findLineOffset(source, filePath);
 
   try {
-    const result = await transformCode(normalizedSource, filePath, options, lineOffset);
+    const result = await transformCode(source, filePath, options, lineOffset);
 
     if (result) {
       return result.code;

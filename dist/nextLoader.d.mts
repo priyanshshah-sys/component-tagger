@@ -105,14 +105,14 @@ interface LoaderContext {
 /**
  * Custom JSX Loader that adds tracking attributes to JSX elements.
  *
- * Strips Next.js-injected RSC header lines before transformation so that
+ * Detects and corrects Next.js RSC header line injection so that
  * data-component-id and data-component-line values are identical between
  * the server and client webpack compilation passes, preventing React
  * hydration errors caused by mismatched attribute values.
  *
  * @param this - The webpack loader context
- * @param source - The source code to transform
- * @returns The transformed source code
+ * @param source - The source code to transform (may have Next.js-injected lines prepended)
+ * @returns The transformed source code with correct line-number attributes
  */
 declare function webPackLoader(this: LoaderContext, source: string): Promise<string>;
 
